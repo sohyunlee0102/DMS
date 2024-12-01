@@ -1,0 +1,148 @@
+/* 전체 헤더 스타일 */
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 20px;
+  background-color: #f8f8f8;
+  border-bottom: 1px solid #ccc;
+  position: sticky;               /* 스크롤 시 고정 */
+  top: 0;                         /* 화면 상단에 고정 */
+  z-index: 1000;
+  margin-bottom: 50px;
+}
+
+.logo-menu {
+  display: flex;
+  align-items: center;
+  gap: 20px; /* 로고와 햄버거 메뉴 사이 간격 */
+}
+
+.logo-text {
+  margin-left: 10px;
+  font-size: 24px;
+  font-weight: bold;
+  color: #563939;
+  text-decoration: none;
+}
+
+.hamburger-menu {
+  cursor: pointer;
+  font-size: 20px;
+  color: #563939;
+  position: relative;
+}
+
+
+/* 오른쪽에 있는 아이템들 */
+.right-items {
+  margin-right: 10px;
+  display: flex;
+  align-items: center;
+  gap: 20px;  /* 각 아이템 사이의 간격 */
+}
+
+.login-link {
+  text-decoration: none;
+  font-size: 16px;
+  color: #563939;
+}
+
+/* 설정 아이콘 */
+/* FontAwesome 아이콘을 사용하려면 아래와 같이 수정 */
+.settings-icon {
+  font-family: 'Font Awesome 5 Free';
+  font-weight: 900; /* 굵은 아이콘을 표시하려면 이 스타일을 추가 */
+  font-size: 20px;
+  cursor: pointer;
+  color: #563939;
+}
+
+/* 언어 드롭다운 */
+.language-dropdown {
+  padding: 5px;
+  font-size: 16px;
+  border-radius: 4px;
+  border: 1px solid #ccc;
+  cursor: pointer;
+}
+
+.language-dropdown:hover {
+  border-color: #007bff;
+}
+
+.dropdown-menu {
+  position: absolute;
+  top: 20px; /* 햄버거 메뉴 아래에 위치 */
+  left: 20;
+  background: #fff;
+  border: 1px solid #ccc;
+  border-radius: 5px;
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+  width: 200px;
+  z-index: 1000;
+}
+
+.menu-item {
+  display: block;
+  padding: 10px 15px;
+  color: #563939;
+  text-decoration: none;
+  font-size: 15px;
+}
+
+.menu-item:hover {
+  background-color: #f0f0f0;
+  color: #007bff;
+}
+
+.menu-item.dropdown {
+  position: relative;
+  padding-right: 20px; /* 삼각형 아이콘 공간 확보 */
+}
+
+/* 삼각형 표시 추가 */
+.menu-item.dropdown::after {
+  content: "▶"; /* 삼각형 표시 */
+  font-size: 12px;
+  color: #333;
+  position: absolute;
+  right: 10px; /* 텍스트 끝 부분에 위치 */
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+/* 부모 메뉴 hover 시 삼각형 색 변경 */
+.menu-item.dropdown:hover::after {
+  color: #007bff;
+}
+
+/* 서브메뉴 */
+.submenu {
+  display: none;
+  position: absolute;
+  top: 0;
+  left: 100%;
+  background: #fff;
+  border: 1px solid #ccc;
+  border-radius: 5px;
+  min-width: 180px;
+  z-index: 1001;
+}
+
+.submenu-item {
+  display: block;
+  padding: 8px 12px;
+  color: #333;
+  text-decoration: none;
+}
+
+.submenu-item:hover {
+  background-color: #f0f0f0;
+  color: #007bff;
+}
+
+/* 서브메뉴 표시 */
+.dropdown:hover .submenu {
+  display: block;
+}
