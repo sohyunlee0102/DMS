@@ -1,5 +1,6 @@
 package dms.project.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -32,6 +33,8 @@ public class ReplicationInstanceService {
     private final Ec2Client ec2Client;
 
     private final DatabaseMigrationClient databaseMigrationClient;
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     private static final Logger logger = LoggerFactory.getLogger(ReplicationInstanceService.class);
 
@@ -135,7 +138,7 @@ public class ReplicationInstanceService {
     }
 
     // Terraform 명령을 실행하고, 진행 상황을 실시간으로 클라이언트에 전달
-    public String executeTerraformWithProgress(Map<String, String> replicationInstanceParams) throws IOException, InterruptedException {
+    public String executeTerraformWithProgress(Map<String, String> replicationInstanceParams, SseEmitter emitter) throws IOException, InterruptedException {
         ProcessBuilder processBuilder = new ProcessBuilder();
 
         // 환경 변수 설정
@@ -179,6 +182,11 @@ public class ReplicationInstanceService {
                 while ((line = reader.readLine()) != null) {
                     output.append(line).append("\n");
                     System.out.println(line);  // 터미널에 실시간으로 출력
+                    try {
+                        emitter.send(line);
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
                 }
             } catch (IOException e) {
                 e.printStackTrace();  // 로깅을 사용해도 좋음
@@ -191,6 +199,11 @@ public class ReplicationInstanceService {
                 while ((line = reader.readLine()) != null) {
                     output.append("ERROR: ").append(line).append("\n");
                     System.err.println(line);  // 오류는 에러 스트림으로 출력
+                    try {
+                        emitter.send("ERROR: " + line);
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
                 }
             } catch (IOException e) {
                 e.printStackTrace();  // 로깅을 사용해도 좋음
@@ -208,9 +221,27 @@ public class ReplicationInstanceService {
         outputThread.join();
         errorThread.join();
 
-        // 종료 코드 반환
         if (exitCode == 0) {
-            return "Replication instance created successfully!";
+            // Terraform apply가 성공적으로 완료되었으므로, terraform output을 실행하여 ARN 가져오기
+            ProcessBuilder outputProcessBuilder = new ProcessBuilder();
+            outputProcessBuilder.command("cmd.exe", "/c", "terraform output -raw replication_instance_arn"); // `replication_instance_arn`은 Terraform output 이름
+            outputProcessBuilder.directory(new File(TERRAFORM_FILE_PATH));
+
+            Process outputProcess = outputProcessBuilder.start();
+            StringBuilder arnOutput = new StringBuilder();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(outputProcess.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    arnOutput.append(line);
+                }
+            }
+
+            int outputExitCode = outputProcess.waitFor();
+            if (outputExitCode == 0) {
+                return arnOutput.toString();  // ARN 반환
+            } else {
+                return "Terraform applied successfully, but failed to retrieve ARN: exit code " + outputExitCode;
+            }
         } else {
             String errorMessage = "Error executing Terraform, exit code: " + exitCode;
             errorMessage += "\n" + output.toString();  // 실제 출력된 내용 추가
@@ -218,17 +249,15 @@ public class ReplicationInstanceService {
         }
     }
 
-    public String createReplicationInstance(Map<String, String> replicationInstanceParams) throws IOException, InterruptedException {
-        // Terraform 명령어 실행
-        try {
-            return executeTerraformWithProgress(replicationInstanceParams);  // Terraform 명령 실행
-        } catch (IOException e) {
-            // IOException 처리
-            return "IO Error occurred while executing Terraform: " + e.getMessage();
-        } catch (InterruptedException e) {
-            // InterruptedException 처리
-            return "Execution interrupted: " + e.getMessage();
+    public String createReplicationInstance(Map<String, String> replicationInstanceParams, SseEmitter emitter) throws IOException, InterruptedException {
+        if (emitter == null) {
+            throw new IllegalArgumentException("Emitter is null. Cannot proceed.");
         }
+
+        String result = executeTerraformWithProgress(replicationInstanceParams, emitter);
+        System.out.println("Before return");
+
+        return result;
     }
 
 }

@@ -14,6 +14,7 @@ resource "aws_dms_endpoint" "source" {
 
   # tags를 Map 형식으로 사용
   tags = var.source_tags  # tags를 변수로 전달
+
 }
 
 # 변수 정의

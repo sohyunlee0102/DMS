@@ -21,7 +21,7 @@ public class DmsTaskRequest {
     private String dataValidation;
     private String startTaskOnCreation;
     private List<Map<String, Object>> tags;
-    private String tableMappings;
+    private Map<String, Object> tableMappings;
     private String source_endpoint_arn;
     private String target_endpoint_arn;
     private String replication_instance_arn;

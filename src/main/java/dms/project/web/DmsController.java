@@ -1,20 +1,25 @@
 package dms.project.web;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import dms.project.dto.*;
 import dms.project.service.*;
+import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 @RestController
 @RequestMapping("/dms")
+@RequiredArgsConstructor
 public class DmsController {
 
     private static final Logger logger = LoggerFactory.getLogger(DmsController.class);
@@ -33,14 +38,22 @@ public class DmsController {
     @Autowired
     private ReplicationInstanceService replicationInstanceService;
 
+    @Autowired
+    private final SseEmitter emitter;
+
+    private final Map<String, SseEmitter> emitters = new ConcurrentHashMap<>();
+
     @PostMapping("/create-source-endpoint")
-    public SseEmitter createSourceEndpoint(@RequestBody SourceEndpointRequest request) {
-        SseEmitter emitter = new SseEmitter();
+    public ResponseEntity<String> createSourceEndpoint(@RequestBody SourceEndpointRequest request) {
+        String clientId = UUID.randomUUID().toString();
+        SseEmitter emitter = createSseEmitter(clientId);
+
+        emitters.put(clientId, emitter); // 클라이언트 ID와 Emitter 매핑
         new Thread(() -> {
             try {
-                System.out.println("I'm HERE");
+                emitter.send("Starting source endpoint creation...");
 
-                // 태그 배열을 쉼표로 구분된 문자열로 변환 (Map<String, Object> 형태의 태그 처리)
+                // 태그 배열을 쉼표로 구분된 문자열로 변환
                 StringBuilder tagsStringBuilder = new StringBuilder();
                 for (Map<String, Object> tag : request.getTags()) {
                     String key = (String) tag.get("key");
@@ -49,15 +62,11 @@ public class DmsController {
                     if (tagsStringBuilder.length() > 0) {
                         tagsStringBuilder.append(", ");
                     }
-                    tagsStringBuilder.append(key).append("=").append(value); // "key=value" 형태로 만듦
+                    tagsStringBuilder.append(key).append("=").append(value);
                 }
-                String tags = tagsStringBuilder.toString(); // 변환된 tags 문자열
+                String tags = tagsStringBuilder.toString();
 
-                // 진행 상태를 클라이언트에 전송 (시작)
-                emitter.send("Starting source endpoint creation...");
-
-                System.out.println(request.getReplicationInstance());
-                // Source endpoint 생성에 필요한 파라미터들
+                // 작업 수행 로직 (예: Terraform 명령 실행)
                 Map<String, String> sourceEndpointParams = Map.of(
                         "endpointId", request.getEndpointId(),
                         "username", request.getUsername(),
@@ -66,38 +75,74 @@ public class DmsController {
                         "port", request.getPort(),
                         "engine", request.getEngine(),
                         "tags", tags,
-                        "RI", request.getReplicationInstance()  // 실제 복제 인스턴스 ARN 추가
+                        "RI", request.getReplicationInstance()
                 );
 
-                // Terraform 명령 실행 및 결과를 실시간으로 클라이언트에 전달
-                String result = sourceEndpointService.createSourceEndpoint(sourceEndpointParams);
+                String result = sourceEndpointService.createSourceEndpoint(sourceEndpointParams, emitter);
+                emitter.send(SseEmitter.event()
+                        .name("source") // 이벤트 이름 지정
+                        .data(result));
+                System.out.println(result);
 
-                // Terraform 실행 후 결과 전달 (성공 메시지)
                 emitter.send("Source endpoint creation completed.");
-                emitter.send(result); // 명령 실행 결과를 전달
-
-                emitter.complete(); // 작업 완료
+                System.out.println("Before complete");
+                emitter.complete();
+                System.out.println("After complete");
             } catch (IOException | InterruptedException e) {
                 try {
                     emitter.send("Error: " + e.getMessage());
                 } catch (IOException ioException) {
                     ioException.printStackTrace();
                 }
-                emitter.completeWithError(e); // 에러 발생 시 에러로 종료
+                completeEmitterWithError(clientId, e);
             }
         }).start();
+
+        System.out.println("Before return2");
+        return ResponseEntity.ok(clientId); // 클라이언트에 ID 반환
+    }
+
+    private SseEmitter createSseEmitter(String clientId) {
+        SseEmitter emitter = new SseEmitter(3600000L); // 1시간 지속
+
+        emitter.onCompletion(() -> emitters.remove(clientId)); // 연결 종료 시 Emitter 제거
+        emitter.onTimeout(() -> emitters.remove(clientId)); // 타임아웃 시 Emitter 제거
+
         return emitter;
     }
 
+    private void completeEmitterWithError(String clientId, Throwable ex) {
+        SseEmitter emitter = emitters.get(clientId);
+        if (emitter != null) {
+            emitter.completeWithError(ex); // 에러로 완료
+            emitters.remove(clientId); // 기존 Emitter 삭제
+        }
+        SseEmitter newEmitter = createSseEmitter(clientId); // 새로운 Emitter 생성
+        emitters.put(clientId, newEmitter); // 새로운 Emitter 저장
+    }
+
+
+    // GET 요청: SSE로 작업 상태 스트리밍
+    @GetMapping("/stream-endpoint")
+    public SseEmitter streamSourceEndpoint(@RequestParam String clientId) {
+        SseEmitter emitter = emitters.get(clientId);
+        if (emitter == null) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Emitter not found for client ID: " + clientId);
+        }
+        return emitter; // 클라이언트와 연결 유지
+    }
     // 타겟 엔드포인트 생성
     @PostMapping("/create-target-endpoint")
-    public SseEmitter createTargetEndpoint(@RequestBody TargetEndpointRequest request) {
-        SseEmitter emitter = new SseEmitter();
+    public ResponseEntity<String> createTargetEndpoint(@RequestBody TargetEndpointRequest request) {
+        String clientId = UUID.randomUUID().toString();
+        SseEmitter emitter = createSseEmitter(clientId);
+
+        emitters.put(clientId, emitter); // 클라이언트 ID와 Emitter 매핑
         new Thread(() -> {
             try {
-                System.out.println("I'm HERE");
+                emitter.send("Starting target endpoint creation...");
 
-                // 태그 배열을 쉼표로 구분된 문자열로 변환 (Map<String, Object> 형태의 태그 처리)
+                // 태그 배열을 쉼표로 구분된 문자열로 변환
                 StringBuilder tagsStringBuilder = new StringBuilder();
                 for (Map<String, Object> tag : request.getTags()) {
                     String key = (String) tag.get("key");
@@ -106,14 +151,11 @@ public class DmsController {
                     if (tagsStringBuilder.length() > 0) {
                         tagsStringBuilder.append(", ");
                     }
-                    tagsStringBuilder.append(key).append("=").append(value); // "key=value" 형태로 만듦
+                    tagsStringBuilder.append(key).append("=").append(value);
                 }
-                String tags = tagsStringBuilder.toString(); // 변환된 tags 문자열
+                String tags = tagsStringBuilder.toString();
 
-                // 진행 상태를 클라이언트에 전송 (시작)
-                emitter.send("Starting target endpoint creation...");
-
-                // Source endpoint 생성에 필요한 파라미터들
+                // 작업 수행 로직 (예: Terraform 명령 실행)
                 Map<String, String> targetEndpointParams = Map.of(
                         "endpointId", request.getEndpointId(),
                         "username", request.getUsername(),
@@ -121,35 +163,42 @@ public class DmsController {
                         "serverName", request.getServerName(),
                         "port", request.getPort(),
                         "engine", request.getEngine(),
-                        "tags", tags,  // 변환된 tags 문자열 추가
+                        "tags", tags,
                         "RI", request.getReplicationInstance()
                 );
 
-                // Terraform 명령 실행 및 결과를 실시간으로 클라이언트에 전달
-                String result = targetEndpointService.createtargetEndpoint(targetEndpointParams);
+                String result = targetEndpointService.createTargetEndpoint(targetEndpointParams, emitter);
+                emitter.send(SseEmitter.event()
+                        .name("target") // 이벤트 이름 지정
+                        .data(result));
+                System.out.println(result);
 
-                // Terraform 실행 후 결과 전달 (성공 메시지)
                 emitter.send("Target endpoint creation completed.");
-                emitter.send(result); // 명령 실행 결과를 전달
-
-                emitter.complete(); // 작업 완료
+                System.out.println("Before complete");
+                emitter.complete();
+                System.out.println("After complete");
             } catch (IOException | InterruptedException e) {
                 try {
                     emitter.send("Error: " + e.getMessage());
                 } catch (IOException ioException) {
                     ioException.printStackTrace();
                 }
-                emitter.completeWithError(e); // 에러 발생 시 에러로 종료
+                completeEmitterWithError(clientId, e);
             }
         }).start();
-        return emitter;
+
+        return ResponseEntity.ok(clientId); // 클라이언트에 ID 반환
     }
 
     @PostMapping("/create-replication-instance")
-    public SseEmitter createReplicationInstance(@RequestBody ReplicationInstanceRequest request) {
-        SseEmitter emitter = new SseEmitter();
+    public ResponseEntity<String> createReplicationInstance(@RequestBody ReplicationInstanceRequest request) {
+        String clientId = UUID.randomUUID().toString();
+        SseEmitter emitter = createSseEmitter(clientId);
+
+        emitters.put(clientId, emitter); // 클라이언트 ID와 Emitter 매핑
         new Thread(() -> {
             try {
+                emitter.send("Starting Replication Instance creation...");
                 // 태그 배열을 쉼표로 구분된 문자열로 변환
                 StringBuilder tagsStringBuilder = new StringBuilder();
                 for (Map<String, Object> tag : request.getTags()) {
@@ -162,9 +211,6 @@ public class DmsController {
                     tagsStringBuilder.append(key).append("=").append(value); // "key=value" 형태로 만듦
                 }
                 String tags = tagsStringBuilder.toString(); // 변환된 tags 문자열
-
-                // 진행 상태를 클라이언트에 전송 (시작)
-                emitter.send("Starting replication instance creation...");
 
                 // 스토리지 값이 String으로 되어 있으므로, int로 변환
                 int storage = Integer.parseInt(request.getStorage());
@@ -184,38 +230,39 @@ public class DmsController {
                 );
 
                 // Terraform 명령 실행 및 결과를 실시간으로 클라이언트에 전달
-                String result = replicationInstanceService.createReplicationInstance(replicationInstanceParams);
+                String result = replicationInstanceService.createReplicationInstance(replicationInstanceParams, emitter);
+                emitter.send(SseEmitter.event()
+                        .name("RI") // 이벤트 이름 지정
+                        .data(result));
+                System.out.println(result);
 
-                // Terraform 실행 후 결과 전달 (성공 메시지)
-                emitter.send("Replication instance creation completed.");
-                emitter.send(result); // 명령 실행 결과를 전달
-
-                emitter.complete(); // 작업 완료
+                emitter.send("Replication Instance creation completed.");
+                System.out.println("Before complete");
+                emitter.complete();
+                System.out.println("After complete");
             } catch (IOException | InterruptedException e) {
                 try {
                     emitter.send("Error: " + e.getMessage());
                 } catch (IOException ioException) {
                     ioException.printStackTrace();
                 }
-                emitter.completeWithError(e); // 에러 발생 시 에러로 종료
-            } catch (NumberFormatException e) {
-                try {
-                    emitter.send("Invalid storage value: " + e.getMessage());
-                } catch (IOException ioException) {
-                    ioException.printStackTrace();
-                }
-                emitter.completeWithError(e); // 에러 발생 시 에러로 종료
+                completeEmitterWithError(clientId, e);
             }
         }).start();
-        return emitter;
+
+        return ResponseEntity.ok(clientId); // 클라이언트에 ID 반환
     }
 
     // DMS 태스크 생성
     @PostMapping("/create-dms-task")
-    public SseEmitter createDmsTask(@RequestBody DmsTaskRequest request) {
-        SseEmitter emitter = new SseEmitter();
+    public ResponseEntity<String> createDmsTask(@RequestBody DmsTaskRequest request) {
+        String clientId = UUID.randomUUID().toString();
+        SseEmitter emitter = createSseEmitter(clientId);
+
+        emitters.put(clientId, emitter); // 클라이언트 ID와 Emitter 매핑
         new Thread(() -> {
             try {
+                emitter.send("Starting Replication Task creation...");
                 StringBuilder tagsStringBuilder = new StringBuilder();
                 for (Map<String, Object> tag : request.getTags()) {
                     String key = (String) tag.get("key");
@@ -227,12 +274,10 @@ public class DmsController {
                     tagsStringBuilder.append(key).append("=").append(value); // "key=value" 형태로 만듦
                 }
                 String tags = tagsStringBuilder.toString(); // 변환된 tags 문자열
-
-                // 진행 상태를 클라이언트에 전송 (시작)
-                emitter.send("Starting DMS task creation...");
-
                 // getMaxLobSize()가 String일 경우 int로 변환
                 int maxLobSize = Integer.parseInt(request.getMaxLobSize());
+
+                ObjectMapper objectMapper = new ObjectMapper();
 
                 // DMS 작업에 필요한 파라미터들
                 Map<String, String> dmsTaskParams = new HashMap<>();
@@ -245,36 +290,41 @@ public class DmsController {
                 dmsTaskParams.put("dataValidation", String.valueOf(request.getDataValidation()));  // boolean을 String으로 변환
                 dmsTaskParams.put("startTaskOnCreation", request.getStartTaskOnCreation());
                 dmsTaskParams.put("tags", tags);
-                dmsTaskParams.put("tableMappings", request.getTableMappings());
                 dmsTaskParams.put("sourceEndpointArn", request.getSource_endpoint_arn());
                 dmsTaskParams.put("targetEndpointArn", request.getTarget_endpoint_arn());
                 dmsTaskParams.put("replicationInstanceArn", request.getReplication_instance_arn());
 
+                try {
+                    String tableMappingsJson = objectMapper.writeValueAsString(request.getTableMappings());
+                    dmsTaskParams.put("tableMappings", tableMappingsJson);
+                } catch (Exception e) {
+                    e.printStackTrace();
+                    dmsTaskParams.put("tableMappings", "{}"); // 예외 처리로 빈 JSON 반환
+                }
+
+                System.out.println(request.getTableMappings());
+
+                System.out.println("HERE IN CONTROLLER");
+
                 // Terraform 명령 실행 및 결과를 실시간으로 클라이언트에 전달
-                String result = dmsService.createDmsTask(dmsTaskParams);
+                dmsService.createDmsTask(dmsTaskParams, emitter);
 
                 // Terraform 실행 후 결과 전달 (성공 메시지)
-                emitter.send("DMS task creation completed.");
-                emitter.send(result); // 명령 실행 결과를 전달
-
-                emitter.complete(); // 작업 완료
+           //     emitter.send("Replication task completed.");
+                System.out.println("Before complete");
+            //    emitter.complete();
+                System.out.println("After complete");
             } catch (IOException | InterruptedException e) {
                 try {
                     emitter.send("Error: " + e.getMessage());
                 } catch (IOException ioException) {
                     ioException.printStackTrace();
                 }
-                emitter.completeWithError(e); // 에러 발생 시 에러로 종료
-            } catch (NumberFormatException e) {
-                try {
-                    emitter.send("Invalid maxLobSize value: " + e.getMessage());
-                } catch (IOException ioException) {
-                    ioException.printStackTrace();
-                }
-                emitter.completeWithError(e); // 에러 발생 시 에러로 종료
+                completeEmitterWithError(clientId, e);
             }
         }).start();
-        return emitter;
+
+        return ResponseEntity.ok(clientId);
     }
 
     @GetMapping("/sourceEndpoints")
@@ -320,16 +370,22 @@ public class DmsController {
 
     @PostMapping("/start-task")
     public ResponseEntity<String> startTask(@RequestBody TaskStartRequest request) {
+        String clientId = UUID.randomUUID().toString();
+        SseEmitter emitter = createSseEmitter(clientId);
+
+        emitters.put(clientId, emitter);
         try {
             System.out.println(request);
-            dmsService.startReplicationTaskWithConnectionCheck(
-                    request.getArn(),
-                    request.getReplicationInstanceArn(),
-                    request.getSourceEndpointArn(),
-                    request.getTargetEndpointArn()
-            );
-            return ResponseEntity.ok("작업이 성공적으로 시작되었습니다.");
+            dmsService.startTask(request.getArn(), emitter);
+      //      emitter.complete();
+            return ResponseEntity.ok(clientId);
         } catch (RuntimeException e) {
+            try {
+                emitter.send("Error: " + e.getMessage());
+            } catch (IOException ioException) {
+                ioException.printStackTrace();
+            }
+            completeEmitterWithError(clientId, e);
             return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("오류: " + e.getMessage());
         }
     }

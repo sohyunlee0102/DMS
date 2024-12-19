@@ -1,5 +1,5 @@
 provider "aws" {
-  region     = "ap-northeast-2"
+  region = "ap-northeast-2"
 }
 
 resource "aws_dms_replication_task" "migration_task" {
@@ -8,48 +8,93 @@ resource "aws_dms_replication_task" "migration_task" {
   replication_instance_arn = var.replication_instance_arn
   source_endpoint_arn      = var.source_endpoint_arn
   target_endpoint_arn      = var.target_endpoint_arn
+  table_mappings          = var.table_mappings
+  tags                     = var.tags
 
-  full_load_settings {
-    target_table_prep_mode = var.target_table_preparation_mode
-  }
+  replication_task_settings = jsonencode({
+    FullLoadSettings = {
+      TargetTablePrepMode = var.target_table_preparation_mode
+    },
+    LOBSettings = {
+      MaxLobSize = var.max_lob_size
+    },
+    ValidationSettings = {
+      DataValidation = var.data_validation
+    },
+    LoggingSettings = {
+      TaskLogs = var.task_logs
+    }
+  })
 
-  lob_settings {
-    max_lob_size = var.max_lob_size
-  }
-
-  validation_settings {
-    data_validation = var.data_validation
-  }
-
-  logging_settings {
-    task_logs = var.task_logs
-  }
-
-  table_mappings = var.table_mappings
-  tags = var.tags
 }
 
-variable "task_name" {}
-variable "migration_type" {}
-variable "target_table_preparation_mode" {}
-variable "lob_column_settings" {}
-variable "max_lob_size" {}
-variable "data_validation" {}
-variable "task_logs" {}
-variable "stark_task_on_creation" {}
-variable "source_endpoint_arn" {}
-variable "target_endpoint_arn" {}
-variable "replication_instance_arn" {}
-variable "tags" {
-  type = map(string)  # tags는 Map 형태로 받음
-  default = {}        # 기본값은 빈 Map
-}
-variable "table_mappings" {
-  description = "Table mappings"
+variable "task_name" {
+  description = "DMS Task name"
   type        = string
-  default     = "{}"  # 기본값을 빈 문자열로 설정
+}
+
+variable "migration_type" {
+  description = "Type of migration"
+  type        = string
+}
+
+variable "start_task_on_creation" {
+  description = "Should the DMS task start on creation?"
+  type        = bool
+  default     = false
+}
+
+variable "target_table_preparation_mode" {
+  description = "Target table preparation mode for full-load settings"
+  type        = string
+  default     = "DO_NOTHING"
+}
+
+variable "max_lob_size" {
+  description = "LOB max size"
+  type        = number
+  default     = 32
+}
+
+variable "data_validation" {
+  description = "Data validation setting"
+  type        = bool
+  default     = false
+}
+
+variable "task_logs" {
+  description = "Should task logs be enabled?"
+  type        = bool
+  default     = false
+}
+
+variable "source_endpoint_arn" {
+  description = "ARN for the source endpoint"
+  type        = string
+}
+
+variable "target_endpoint_arn" {
+  description = "ARN for the target endpoint"
+  type        = string
+}
+
+variable "replication_instance_arn" {
+  description = "ARN for the replication instance"
+  type        = string
+}
+
+variable "table_mappings" {
+  description = "Table Mappings JSON string"
+  type        = string
+}
+
+variable "tags" {
+  description = "Tags for the DMS Task"
+  type        = map(string)
+  default     = {}
 }
 
 output "dms_task_arn" {
-  value = aws_dms_replication_task.migration_task.replication_task_arn
+  description = "The ARN of the created DMS replication task"
+  value       = aws_dms_replication_task.migration_task.replication_task_arn
 }

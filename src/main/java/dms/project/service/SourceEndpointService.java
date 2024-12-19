@@ -1,7 +1,13 @@
 package dms.project.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
+import org.json.simple.JSONObject;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
@@ -13,22 +19,45 @@ import java.net.URLDecoder;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 @Service
+@RequiredArgsConstructor
 public class SourceEndpointService {
 
     private static final String TERRAFORM_FILE_PATH = "C:\\project\\project\\src\\main\\resources\\terraform\\source"; // 실제 경로로 변경
 
-    private String testStatus = "idle";
+    @Autowired
+    private final DatabaseMigrationClient databaseMigrationClient;
+
+    // 클라이언트별 SSEEmitter 저장소
+    private final Map<String, SseEmitter> emitters = new ConcurrentHashMap<>();
 
     @Value("${aws.access-key}")
     private String accessKey;
 
     @Value("${aws.secret-key}")
     private String secretKey;
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    public SseEmitter createEmitter(String clientId) {
+        SseEmitter emitter = new SseEmitter(30 * 60 * 1000L); // 30분 타임아웃
+        emitters.put(clientId, emitter);
+
+        emitter.onCompletion(() -> emitters.remove(clientId));
+        emitter.onTimeout(() -> emitters.remove(clientId));
+        emitter.onError((e) -> emitters.remove(clientId));
+
+        return emitter;
+    }
+
+    public SseEmitter getEmitter(String clientId) {
+        return emitters.get(clientId);
+    }
 
     public DatabaseMigrationClient createDatabaseMigrationClient(String region) {
         AwsBasicCredentials awsCredentials = AwsBasicCredentials.create(
@@ -41,42 +70,33 @@ public class SourceEndpointService {
     }
 
     public List<Map<String, String>> getSourceEndpoints(String region) {
-        // 리전별로 DatabaseMigrationClient 생성
         DatabaseMigrationClient client = createDatabaseMigrationClient(region);
-
-        // DescribeEndpointsRequest 생성
         DescribeEndpointsRequest request = DescribeEndpointsRequest.builder().build();
-
-        // 엔드포인트 조회
         DescribeEndpointsResponse response = client.describeEndpoints(request);
 
-        // 엔드포인트 응답 출력 (디버깅용)
-        System.out.println("DescribeEndpointsResponse: " + response);
-
-        // 각 엔드포인트의 타입을 출력하여 확인
-        response.endpoints().forEach(endpoint -> {
-            System.out.println("Endpoint Identifier: " + endpoint.endpointIdentifier() + ", Type: " + endpoint.endpointTypeAsString());
-        });
-
-        // 소스 엔드포인트만 필터링하여 ARN 목록 추출
-        List<Map<String, String>> sourceEndpoints = response.endpoints().stream()
-                .filter(endpoint -> "SOURCE".equals(endpoint.endpointTypeAsString()))  // 엔드포인트 타입이 'SOURCE'인 경우만 필터링
+        return response.endpoints().stream()
+                .filter(endpoint -> "SOURCE".equals(endpoint.endpointTypeAsString()))
                 .map(endpoint -> {
                     Map<String, String> endpointData = new HashMap<>();
-                    endpointData.put("id", endpoint.endpointIdentifier());  // ID
-                    endpointData.put("arn", endpoint.endpointArn());  // ARN
+                    endpointData.put("id", endpoint.endpointIdentifier());
+                    endpointData.put("arn", endpoint.endpointArn());
                     return endpointData;
                 })
                 .collect(Collectors.toList());
-
-        // 필터링된 소스 엔드포인트 로그 출력 (디버깅용)
-        System.out.println("Filtered Source Endpoints: " + sourceEndpoints);
-
-        return sourceEndpoints;
     }
 
-    // Terraform 명령을 실행하고, 진행 상황을 실시간으로 클라이언트에 전달
-    public String executeTerraformWithProgress(Map<String, String> sourceEndpointParams) throws IOException, InterruptedException {
+    public String createSourceEndpoint(Map<String, String> sourceEndpointParams, SseEmitter emitter) throws IOException, InterruptedException {
+        if (emitter == null) {
+            throw new IllegalArgumentException("Emitter is null. Cannot proceed.");
+        }
+
+        String result = executeTerraformWithProgress(sourceEndpointParams, emitter);
+        System.out.println("Before return");
+
+        return result;
+    }
+
+    public String executeTerraformWithProgress(Map<String, String> sourceEndpointParams, SseEmitter emitter) throws IOException, InterruptedException {
         ProcessBuilder processBuilder = new ProcessBuilder();
 
         // 환경 변수 설정
@@ -86,6 +106,8 @@ public class SourceEndpointService {
         processBuilder.environment().put("TF_VAR_source_server_name", sourceEndpointParams.get("serverName"));
         processBuilder.environment().put("TF_VAR_source_port", sourceEndpointParams.get("port"));
         processBuilder.environment().put("TF_VAR_source_engine", sourceEndpointParams.get("engine"));
+
+        String replicationInstance = sourceEndpointParams.get("RI");
 
         // tags 값을 쉼표로 구분된 문자열로 가져옴
         String tags = sourceEndpointParams.get("tags");
@@ -103,8 +125,13 @@ public class SourceEndpointService {
         // Terraform에 map 형태로 전달 (tags를 환경 변수로 전달)
         processBuilder.environment().put("TF_VAR_source_tags", tagMap.toString());  // map 형태로 전달
 
+        processBuilder.environment().put("AWS_ACCESS_KEY_ID", accessKey);  // AWS Access Key
+        processBuilder.environment().put("AWS_SECRET_ACCESS_KEY", secretKey);
+
         // Terraform 명령어 설정
-        processBuilder.command("cmd.exe", "/c", "terraform init && terraform apply -auto-approve");
+        processBuilder.command("cmd.exe", "/c",
+                "terraform init && terraform apply -auto-approve");
+
         processBuilder.directory(new File(TERRAFORM_FILE_PATH));
 
         // 출력 처리
@@ -118,7 +145,11 @@ public class SourceEndpointService {
                 while ((line = reader.readLine()) != null) {
                     output.append(line).append("\n");
                     System.out.println(line);  // 터미널에 실시간으로 출력
-                    // 이 곳에 클라이언트에 실시간으로 진행 상황을 전달하는 로직을 추가할 수 있습니다.
+                    try {
+                        emitter.send(line);
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
                 }
             } catch (IOException e) {
                 e.printStackTrace();  // 로깅을 사용해도 좋음
@@ -131,7 +162,11 @@ public class SourceEndpointService {
                 while ((line = reader.readLine()) != null) {
                     output.append("ERROR: ").append(line).append("\n");
                     System.err.println(line);  // 오류는 에러 스트림으로 출력
-                    // 이 곳에 클라이언트에 실시간으로 오류 메시지를 전달하는 로직을 추가할 수 있습니다.
+                    try {
+                        emitter.send("ERROR: " + line);
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
                 }
             } catch (IOException e) {
                 e.printStackTrace();  // 로깅을 사용해도 좋음
@@ -149,129 +184,135 @@ public class SourceEndpointService {
         outputThread.join();
         errorThread.join();
 
-        // 종료 코드 반환
-        if (exitCode == 0) {
-            // 출력에서 ARN만 추출하여 반환 (출력에서 ARN을 찾는 로직 추가)
-            String arn = extractArn(output.toString());
+        processBuilder.command("cmd.exe", "/c",
+                "terraform output -raw source_endpoint_arn");  // ARN 출력 명령어 실행
+        Process outputProcess = processBuilder.start();  // ARN 가져오기 프로세스 시작
+        BufferedReader outputReader = new BufferedReader(new InputStreamReader(outputProcess.getInputStream()));
 
-            if (arn != null) {
-                // URL 디코딩하여 특수 문자 제거
-                try {
-                    arn = URLDecoder.decode(arn, "UTF-8");
-                } catch (UnsupportedEncodingException e) {
-                    System.err.println("Error decoding ARN: " + e.getMessage());
-                    arn = null;
-                }
+        StringBuilder arnOutput = new StringBuilder();
+        String line;
+        while ((line = outputReader.readLine()) != null) {
+            arnOutput.append(line).append("\n");
+        }
 
-                // 쌍따옴표 제거
-                if (arn != null) {
-                    arn = arn.replace("\"", "");  // 쌍따옴표 제거
-                }
+        int outputExitCode = outputProcess.waitFor();
+        if (outputExitCode == 0) {
+            String arn = arnOutput.toString().trim();  // ARN 가져오기 성공
+            emitter.send("Terraform execution successful.");
+            emitter.send("Testing connection of created endpoint...");
+            System.out.println("Arn: " + arn);
+            System.out.println("RI : " + replicationInstance);
+            processBuilder.command("cmd.exe", "/c",
+                    "aws dms test-connection --region ap-northeast-2 " +
+                            "--endpoint-arn " + arn +
+                            " --replication-instance-arn " + replicationInstance
+            );
 
-                if (arn != null && !arn.isEmpty()) {
-                    return arn;  // ARN만 반환
-                } else {
-                    throw new RuntimeException("ARN could not be extracted or decoded properly.");
+            Process connectionProcess = processBuilder.start();  // <-- Test-Connection 명령어 실행
+            BufferedReader connectionReader = new BufferedReader(new InputStreamReader(connectionProcess.getInputStream()));
+
+            StringBuilder connectionOutput = new StringBuilder();
+            String connectionLine;
+            while ((connectionLine = connectionReader.readLine()) != null) {
+                connectionOutput.append(connectionLine).append("\n");
+                System.out.println(connectionLine);  // 터미널에 실시간으로 출력
+            }
+
+            int connectionExitCode = connectionProcess.waitFor();
+            if (connectionExitCode == 0) {
+                while (true) {
+                    processBuilder.command("cmd.exe", "/c",
+                            "aws dms describe-connections --region ap-northeast-2 --filters Name=endpoint-arn,Values=" + arn
+                    );
+
+                    Process describeProcess = processBuilder.start();
+                    BufferedReader describeReader = new BufferedReader(new InputStreamReader(describeProcess.getInputStream()));
+
+                    StringBuilder describeOutput = new StringBuilder();
+                    String describeLine;
+                    while ((describeLine = describeReader.readLine()) != null) {
+                        describeOutput.append(describeLine).append("\n");
+                        System.out.println(describeLine);
+                    }
+
+                    int describeExitCode = describeProcess.waitFor();
+                    System.out.println("Describe: " + describeExitCode);
+                    if (describeOutput.toString().contains("testing")) {
+                        System.out.println("Contain");
+                    }
+                    if (describeExitCode == 0 && describeOutput.toString().contains("successful")) {
+                        emitter.send("Connection test successful on status check.");
+                        /*
+                        ProcessBuilder unlockProcessBuilder = new ProcessBuilder("terraform", "force-unlock", "<lock_id>");
+                        unlockProcessBuilder.start();
+                         */
+                        return arn;  // ARN 반환
+                    } else if (describeOutput.toString().contains("testing"))  {
+                        emitter.send("Still testing...");
+                        Thread.sleep(5000);  // 5초 대기 후 재시도
+                    } else {
+                        // describeOutput JSON 파싱
+                        JsonNode rootNode = objectMapper.readTree(describeOutput.toString());
+                        JsonNode connections = rootNode.get("Connections");
+
+                        if (connections != null && connections.isArray() && connections.size() > 0) {
+                            JsonNode connection = connections.get(0); // 첫 번째 연결 정보 사용
+                            String lastFailureMessage = connection.get("LastFailureMessage").asText();
+
+                            // 에러 형식으로 프론트에 전달
+                            String errorMessage = objectMapper.writeValueAsString(Map.of(
+                                    "type", "error",
+                                    "message", lastFailureMessage
+                            ));
+                            emitter.send(errorMessage);
+                            throw new RuntimeException("Test connection failed.");
+                        } else {
+                            // 실패 이유를 추출할 수 없는 경우 기본 메시지 전달
+                            String errorMessage = objectMapper.writeValueAsString(Map.of(
+                                    "type", "error",
+                                    "message", "Unable to parse failure reason from response."
+                            ));
+                            emitter.send(errorMessage);
+                            throw new RuntimeException("Test connection failed.");
+                        }
+                    }
+                    /*
+                    ProcessBuilder unlockProcessBuilder = new ProcessBuilder("terraform", "force-unlock", "<lock_id>");
+                    unlockProcessBuilder.start();
+                     */
                 }
             } else {
-                throw new RuntimeException("ARN could not be extracted from Terraform output.");
+                String errorMessage = objectMapper.writeValueAsString(Map.of(
+                        "type", "error",
+                        "message", "Connection test failed with exit code: " + connectionExitCode
+                ));
+                emitter.send(errorMessage);emitter.send("Connection test failed with exit code: " + connectionExitCode);
+                throw new RuntimeException("Connection test failed.");
+
             }
         } else {
-            return "Error executing Terraform, exit code: " + exitCode;
+            String errorMessage = objectMapper.writeValueAsString(Map.of(
+                    "type", "error",
+                    "message", "Terraform execution failed with exit code: " + exitCode
+            ));
+            emitter.send(errorMessage);
+            throw new RuntimeException("Terraform execution failed.");
         }
-    }
-
-    public String createSourceEndpoint(Map<String, String> sourceEndpointParams) throws IOException, InterruptedException {
-        // 1. Terraform 적용 후, 생성된 엔드포인트 ARN을 얻음
-        String sourceEndpointArn = executeTerraformWithProgress(sourceEndpointParams);
-
-        // 2. 소스 엔드포인트 연결 테스트
-        if (sourceEndpointArn != null && !sourceEndpointArn.isEmpty()) {
-            testSourceConnection(sourceEndpointArn, sourceEndpointParams.get("RI"));
-        }
-
-        return "Terraform applied and connection test completed.";
     }
 
     private String extractArn(String terraformOutput) {
-        // "arn:aws:dms:"로 시작하는 ARN을 추출
         String arnPrefix = "arn:aws:dms:";
         int startIndex = terraformOutput.indexOf(arnPrefix);
 
         if (startIndex != -1) {
-            int endIndex = terraformOutput.indexOf("\"", startIndex);  // 종료 인덱스를 찾기 위해 "을 찾음
-            if (endIndex == -1) {
-                endIndex = terraformOutput.length();  // 종료 인덱스를 못 찾으면 출력의 끝까지
-            }
-
-            // ARN 추출
-            String arn = terraformOutput.substring(startIndex, endIndex);
-
-            // ARN이 올바른 형식인지 확인
-            if (arn.matches("arn:aws:dms:[a-zA-Z0-9-]+:[0-9]+:endpoint:[a-zA-Z0-9]+")) {
-                return arn;  // 유효한 ARN 반환
-            } else {
-                return null;  // 유효하지 않은 ARN
-            }
+            int endIndex = terraformOutput.indexOf("\"", startIndex);
+            return endIndex != -1 ? terraformOutput.substring(startIndex, endIndex) : terraformOutput.substring(startIndex);
         }
-        return null;  // ARN을 찾을 수 없으면 null 반환
+        return null;
     }
 
-    public String testSourceConnection(String sourceEndpointArn, String replicationInstanceArn) {
-        // "testing" 상태일 때, 연결 테스트 진행 중임을 표시
-        if ("testing".equals(testStatus)) {
-            return "Test is in progress. Please wait...";
-        }
-
-        try {
-            // 상태를 "testing"으로 변경하여 연결 테스트가 진행 중임을 나타냄
-            testStatus = "testing";
-
-            // AWS DMS 연결 테스트 요청 생성
-            TestConnectionRequest testConnectionRequest = TestConnectionRequest.builder()
-                    .endpointArn(sourceEndpointArn)  // 소스 엔드포인트 ARN
-                    .replicationInstanceArn(replicationInstanceArn)  // 복제 인스턴스 ARN
-                    .build();
-
-            // DMS 클라이언트 생성
-            DatabaseMigrationClient databaseMigrationClient = createDatabaseMigrationClient("ap-northeast-2");
-
-            // 연결 테스트 실행
-            TestConnectionResponse testSourceResponse = databaseMigrationClient.testConnection(testConnectionRequest);
-
-            // 응답이 null일 경우를 처리하는 로직 추가
-            if (testSourceResponse == null || testSourceResponse.sdkHttpResponse() == null) {
-                System.err.println("Connection response is null.");
-                testStatus = "failed";  // 실패 상태로 변경
-                return "Connection response is null.";
-            }
-
-            // 연결 테스트 결과 확인
-            if (testSourceResponse.sdkHttpResponse().isSuccessful()) {
-                System.out.println("Source Endpoint Connection Test Success.");
-                testStatus = "success";  // 테스트 성공 시 상태를 "success"로 설정
-                return "Source Endpoint Connection Test Success.";  // 성공 메시지 반환
-            } else {
-                System.err.println("Source Endpoint Connection Test Failed: " + testSourceResponse.sdkHttpResponse().statusText());
-                testStatus = "failed";  // 테스트 실패 시 상태를 "failed"로 설정
-                return "Source Endpoint Connection Test Failed: " + testSourceResponse.sdkHttpResponse().statusText();  // 실패 메시지 반환
-            }
-        } catch (DatabaseMigrationException e) {
-            System.err.println("Error while testing connection: " + e.getMessage());
-            e.printStackTrace(); // 오류 상세 확인
-            testStatus = "failed";  // 예외 발생 시 실패 상태로 변경
-            return "Error while testing connection: " + e.getMessage();  // 오류 메시지 반환
-        } catch (Exception e) {
-            // 다른 예외 처리
-            System.err.println("Unexpected error: " + e.getMessage());
-            e.printStackTrace();
-            testStatus = "failed";  // 예기치 못한 오류 발생 시 "failed"로 상태 변경
-            return "Unexpected error: " + e.getMessage();  // 예기치 못한 오류 처리
-        }
-    }
-
-    public String getTestStatus() {
-        return testStatus;  // 현재 상태 반환
+    private void completeEmitterWithError(SseEmitter emitter) {
+        emitter.completeWithError(new RuntimeException("Connection test failed.")); // 에러로 Emitter 완료 처리
     }
 
 }

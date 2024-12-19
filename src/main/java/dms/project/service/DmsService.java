@@ -1,15 +1,15 @@
 package dms.project.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import software.amazon.awssdk.services.databasemigration.DatabaseMigrationClient;
 import software.amazon.awssdk.services.databasemigration.model.*;
-import software.amazon.awssdk.services.ssmincidents.model.ListReplicationSetsRequest;
-import software.amazon.awssdk.services.ssmincidents.model.ListReplicationSetsResponse;
 
 import java.io.*;
 import java.util.*;
+import java.util.concurrent.*;
 import java.util.stream.Collectors;
 
 @Service
@@ -20,92 +20,122 @@ public class DmsService {
 
     private final DatabaseMigrationClient databaseMigrationClient;
 
-    public void startReplicationTaskWithConnectionCheck(String taskArn, String replicationInstanceArn, String sourceEndpointArn, String targetEndpointArn) {
-        // 1. Test connections
-        try {
-            testReplicationInstanceStatus(replicationInstanceArn); // Check the status of the replication instance
-            testConnections(replicationInstanceArn, sourceEndpointArn, targetEndpointArn); // Test source and target endpoint connections
-        } catch (RuntimeException e) {
-            // If connection test fails, handle the exception
-            throw new RuntimeException("Connection test failed: " + e.getMessage());
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    public void startTask(String taskArn, SseEmitter emitter) {
+        Boolean restart = false;
+
+        List<Map<String, String>> existingTasks = getTasks(taskArn.split(":")[3]);
+        System.out.println(existingTasks);
+
+        if (existingTasks.stream().anyMatch(task -> !task.get("status").equals("ready") && task.get("arn").equals(taskArn))) {
+            restart = true;
         }
 
-        // 2. If connections are successful, start the replication task
-        try {
-            StartReplicationTaskRequest request = StartReplicationTaskRequest.builder()
-                    .replicationTaskArn(taskArn) // Use the ARN of the already created task
-                    .startReplicationTaskType(StartReplicationTaskTypeValue.START_REPLICATION)
-                    .build();
+        System.out.println(restart);
 
-            StartReplicationTaskResponse response = databaseMigrationClient.startReplicationTask(request);
-            System.out.println("Task started successfully: " + response.replicationTask().replicationTaskArn());
-        } catch (DatabaseMigrationException e) {
-            throw new RuntimeException("AWS DMS error: " + e.getMessage(), e);
+        if (!restart) {
+            StartReplicationTaskResponse startResponse = databaseMigrationClient.startReplicationTask(
+                    StartReplicationTaskRequest.builder()
+                            .replicationTaskArn(taskArn)
+                            .startReplicationTaskType(StartReplicationTaskTypeValue.START_REPLICATION)
+                            .build()
+            );
+        } else {
+            StartReplicationTaskResponse startResponse = databaseMigrationClient.startReplicationTask(
+                    StartReplicationTaskRequest.builder()
+                    .replicationTaskArn(taskArn)
+                    .startReplicationTaskType(StartReplicationTaskTypeValue.RELOAD_TARGET)
+                    .build());
+
         }
-    }
 
-    private void testConnections(String replicationInstanceArn, String sourceEndpointArn, String targetEndpointArn) {
-        try {
-            // 1. 소스 엔드포인트에 대한 연결 테스트
-            TestConnectionRequest testConnectionRequest = TestConnectionRequest.builder()
-                    .replicationInstanceArn(replicationInstanceArn)
-                    .endpointArn(sourceEndpointArn)
-                    .build();
-            TestConnectionResponse testSourceResponse = databaseMigrationClient.testConnection(testConnectionRequest);
-            System.out.println("Source Endpoint Connection Test Success.");
+        System.out.println("Migration has started.");
 
-            // 2. 타겟 엔드포인트에 대한 연결 테스트
-            testConnectionRequest = TestConnectionRequest.builder()
-                    .replicationInstanceArn(replicationInstanceArn)
-                    .endpointArn(targetEndpointArn)
-                    .build();
-            TestConnectionResponse testTargetResponse = databaseMigrationClient.testConnection(testConnectionRequest);
-            System.out.println("Target Endpoint Connection Test Success.");
+        // 2. 상태 확인을 위한 쓰레드 시작
+        new Thread(() -> {
+            try {
+                emitter.send("Start Data Migration...");
 
-            // 3. 복제 인스턴스에 대한 연결 테스트
-            DescribeReplicationInstancesRequest describeReplicationInstancesRequest = DescribeReplicationInstancesRequest.builder().build();
-            DescribeReplicationInstancesResponse describeReplicationInstancesResponse = databaseMigrationClient.describeReplicationInstances(describeReplicationInstancesRequest);
+                while (true) {
+                    try {
+                        System.out.println("Fetching task status for ARN: " + taskArn);
 
-            describeReplicationInstancesResponse.replicationInstances().forEach(instance -> {
-                System.out.println("Replication Instance ARN: " + instance.replicationInstanceArn() + " - Status: " + instance.replicationInstanceStatus());
-            });
+                        // 3. 태스크 상태 조회
+                        DescribeReplicationTasksResponse describeResponse = databaseMigrationClient.describeReplicationTasks(
+                                DescribeReplicationTasksRequest.builder()
+                                        .filters(Filter.builder()
+                                                .name("replication-task-arn")
+                                                .values(taskArn)
+                                                .build())
+                                        .build()
+                        );
 
-        } catch (DatabaseMigrationException e) {
-            System.err.println("Error while testing connection: " + e.getMessage());
-            e.printStackTrace(); // 스택 트레이스를 통해 자세한 오류 확인
-            throw new RuntimeException("Error while testing connection: " + e.getMessage(), e);
-        }
-    }
+                        System.out.println("DescribeReplicationTasksResponse: " + describeResponse);
 
-    private void testReplicationInstanceStatus(String replicationInstanceArn) {
-        try {
-            // Check the status of the replication instance
-            DescribeReplicationInstancesRequest describeRequest = DescribeReplicationInstancesRequest.builder()
-                    .filters(Filter.builder()
-                            .name("replication-instance-arn")
-                            .values(replicationInstanceArn)
-                            .build())
-                    .build();
+                        if (!describeResponse.replicationTasks().isEmpty()) {
+                            ReplicationTask task = describeResponse.replicationTasks().get(0);
+                            String status = task.status();
+                            String progress = task.replicationTaskStats() != null
+                                    ? task.replicationTaskStats().fullLoadProgressPercent() + "%"
+                                    : "N/A";
 
-            DescribeReplicationInstancesResponse describeResponse = databaseMigrationClient.describeReplicationInstances(describeRequest);
+                            System.out.println("Task Status: " + status);
+                            System.out.println("Task Progress: " + progress);
 
-            // Check if the replication instance is found
-            if (describeResponse.replicationInstances().isEmpty()) {
-                throw new RuntimeException("Replication instance not found.");
+                            try {
+                                emitter.send(Map.of(
+                                        "statusOfTask", status,
+                                        "progressOfTask", progress
+                                ));
+                            } catch (IOException e) {
+                                System.err.println("Error sending event: " + e.getMessage());
+                                break;
+                            }
+
+                            if ("completed".equalsIgnoreCase(status) || "stopped".equalsIgnoreCase(status)) {
+                                System.out.println("Task completed successfully.");
+                                emitter.send("Data Migration completed.");
+                                emitter.complete();
+                                break;
+                            } else if ("failed".equalsIgnoreCase(status)) {
+                                String errorMessage = objectMapper.writeValueAsString(Map.of(
+                                        "type", "error",
+                                        "message", "Data Migration has failed."
+                                ));
+                                System.err.println("Task failed: " + errorMessage);
+                                emitter.send(errorMessage);
+                                emitter.complete();
+                                break;
+                            }
+                        } else {
+                            System.out.println("No replication tasks found for ARN: " + taskArn);
+                        }
+
+                        // 6. 일정 시간 대기 후 재시도
+                        System.out.println("Waiting 5 seconds before the next status check...");
+                        Thread.sleep(5000);
+
+                    } catch (Exception e) {
+                        System.err.println("Error during task status check: " + e.getMessage());
+                        e.printStackTrace();
+                        break;
+                    }
+                }
+            } catch (Exception e) {
+                try {
+                    emitter.send(new ObjectMapper().writeValueAsString(Map.of(
+                            "type", "error",
+                            "message", "Migration task execution has failed."
+                    )));
+                } catch (IOException ioException) {
+                    System.err.println("Failed to send error message: " + ioException.getMessage());
+                }
+            } finally {
+                emitter.complete();
             }
+        }).start();
 
-            ReplicationInstance replicationInstance = describeResponse.replicationInstances().get(0);
-            String replicationInstanceStatus = replicationInstance.replicationInstanceStatus();
-
-            // Check if the replication instance status is 'available'
-            if (!"available".equals(replicationInstanceStatus)) {
-                throw new RuntimeException("Replication instance status is not 'available'. Current status: " + replicationInstanceStatus);
-            }
-
-            System.out.println("Replication instance status: " + replicationInstanceStatus);
-        } catch (DatabaseMigrationException e) {
-            throw new RuntimeException("Error while checking replication instance status: " + e.getMessage(), e);
-        }
     }
 
     public List<Map<String, String>> getTasks(String region) {
@@ -137,26 +167,16 @@ public class DmsService {
         return tasks;
     }
 
-    private String getReplicationInstanceArnByRegion(String region) {
-        // 이 메서드는 특정 region에 있는 복제 인스턴스를 조회하여 ARN을 반환하는 로직입니다.
-        DescribeReplicationInstancesRequest request = DescribeReplicationInstancesRequest.builder()
-                .build();
-
-        DescribeReplicationInstancesResponse response = databaseMigrationClient.describeReplicationInstances(request);
-
-        // 복제 인스턴스를 순회하면서 region에 맞는 ARN을 찾습니다.
-        return response.replicationInstances().stream()
-                .filter(instance -> instance.replicationInstanceArn().contains(region))  // region을 포함한 ARN 필터링
-                .map(ReplicationInstance::replicationInstanceArn)
-                .findFirst()
-                .orElse(null);  // 해당 지역에 맞는 복제 인스턴스가 없으면 null 반환
-    }
-
     // Terraform 명령을 실행하고, 진행 상황을 실시간으로 클라이언트에 전달
-    public String executeTerraformWithProgress(Map<String, String> dmsTaskParams) throws IOException, InterruptedException {
+    public String executeTerraformWithProgress(Map<String, String> dmsTaskParams, SseEmitter emitter) throws IOException, InterruptedException {
         ProcessBuilder processBuilder = new ProcessBuilder();
+        // 필수 환경 변수 확인
+        String tableMappings = dmsTaskParams.get("tableMappings");
+        if (tableMappings == null || tableMappings.trim().isEmpty()) {
+            throw new IllegalArgumentException("tableMappings is required and cannot be empty.");
+        }
 
-        // 환경 변수 설정
+        // Terraform 환경 변수 설정
         processBuilder.environment().put("TF_VAR_task_name", dmsTaskParams.get("taskName"));
         processBuilder.environment().put("TF_VAR_migration_type", dmsTaskParams.get("migrationType"));
         processBuilder.environment().put("TF_VAR_target_table_preparation_mode", dmsTaskParams.get("targetTablePreparationMode"));
@@ -164,89 +184,124 @@ public class DmsService {
         processBuilder.environment().put("TF_VAR_max_lob_size", dmsTaskParams.get("maxLobSize"));
         processBuilder.environment().put("TF_VAR_data_validation", dmsTaskParams.get("dataValidation"));
         processBuilder.environment().put("TF_VAR_task_logs", dmsTaskParams.get("taskLogs"));
-        processBuilder.environment().put("TF_VAR_start_task_on_creation", dmsTaskParams.get("startTaskOnCreation"));
         processBuilder.environment().put("TF_VAR_source_endpoint_arn", dmsTaskParams.get("sourceEndpointArn"));
         processBuilder.environment().put("TF_VAR_target_endpoint_arn", dmsTaskParams.get("targetEndpointArn"));
         processBuilder.environment().put("TF_VAR_replication_instance_arn", dmsTaskParams.get("replicationInstanceArn"));
+        processBuilder.environment().put("TF_VAR_table_mappings", tableMappings);
 
-        String tableMappings = dmsTaskParams.get("tableMappings");
-        if (tableMappings == null || tableMappings.trim().isEmpty()) {
-            throw new IllegalArgumentException("tableMappings is required and cannot be empty.");
-        }
-
-        String tags = dmsTaskParams.get("tags");
-        String[] tagPairs = tags.split(",");  // ","로 구분된 태그 쌍을 배열로 분리
-
-        // tagMap 생성
+        // Handle tags safely
+        String tags = dmsTaskParams.getOrDefault("tags", "");
         Map<String, String> tagMap = new HashMap<>();
-        for (String pair : tagPairs) {
-            String[] keyValue = pair.split("=");  // "key=value" 형식으로 분리
-            if (keyValue.length == 2) {
-                tagMap.put(keyValue[0], keyValue[1]);
+        if (tags != null && !tags.trim().isEmpty()) {
+            String[] tagPairs = tags.split(",");
+            for (String pair : tagPairs) {
+                String[] keyValue = pair.split("=");
+                if (keyValue.length == 2) {
+                    tagMap.put(keyValue[0], keyValue[1]);
+                }
             }
         }
+        processBuilder.environment().put("TF_VAR_task_tags", tagMap.toString());
 
-        // Terraform에 map 형태로 전달 (tags를 환경 변수로 전달)
-        processBuilder.environment().put("TF_VAR_task_tags", tagMap.toString());  // map 형태로 전달
-
-        // Terraform 명령어 설정
+        // Terraform 명령어 실행
         processBuilder.command("cmd.exe", "/c", "terraform init && terraform apply -auto-approve");
         processBuilder.directory(new File(TERRAFORM_FILE_PATH));
 
-        // 출력 처리
-        StringBuilder output = new StringBuilder();
+        System.out.println("Starting Terraform with parameters: " + dmsTaskParams);
+
         Process process = processBuilder.start();
 
-        // 표준 출력 및 표준 오류 스트림을 비동기적으로 처리
         Thread outputThread = new Thread(() -> {
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
-                    output.append(line).append("\n");
-                    System.out.println(line);  // 터미널에 실시간으로 출력
+                    System.out.println(line);
+                    try {
+                        emitter.send(line);
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
                 }
             } catch (IOException e) {
-                e.printStackTrace();  // 로깅을 사용해도 좋음
+                e.printStackTrace();
             }
         });
 
-        Thread errorThread = new Thread(() -> {
+        Thread errorThread =  new Thread(() -> {
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getErrorStream()))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
-                    output.append("ERROR: ").append(line).append("\n");
-                    System.err.println(line);  // 오류는 에러 스트림으로 출력
+                    System.err.println(line);
+                    try {
+                        emitter.send("ERROR: " + line);
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
                 }
             } catch (IOException e) {
-                e.printStackTrace();  // 로깅을 사용해도 좋음
+                e.printStackTrace();
             }
         });
 
-        // 쓰레드 시작
         outputThread.start();
         errorThread.start();
 
-        // Terraform 명령어 완료 대기
         int exitCode = process.waitFor();
 
-        // 프로세스 종료 대기
         outputThread.join();
         errorThread.join();
 
-        // 종료 코드 반환
+        System.out.println(exitCode);
+
         if (exitCode == 0) {
-            return "Terraform applied successfully!";
+            if ("false".equals(dmsTaskParams.get("startTaskOnCreation"))) {
+                System.out.println("false");
+                emitter.send("Migration task creation completed.");
+                emitter.complete();
+                return "Success";
+            } else {
+                System.out.println("true");
+                // terraform output을 실행하여 taskArn을 추출
+                ProcessBuilder outputProcessBuilder = new ProcessBuilder();
+                outputProcessBuilder.command("cmd.exe", "/c", "terraform output -raw dms_task_arn");  // 'dms_task_arn' output 값을 가져옴
+                outputProcessBuilder.directory(new File(TERRAFORM_FILE_PATH));
+
+                Process outputProcess = outputProcessBuilder.start();
+                int outputExitCode = outputProcess.waitFor();
+
+                if (outputExitCode == 0) {
+                    // Output 값 읽기
+                    BufferedReader reader = new BufferedReader(new InputStreamReader(outputProcess.getInputStream()));
+                    String taskArn = reader.readLine();  // output값을 추출
+                    System.out.println("Before start");
+                    startTask(taskArn, emitter);  // DMS 태스크 수동 시작
+                    return "Success";
+                } else {
+                    String errorMessage = objectMapper.writeValueAsString(Map.of(
+                            "type", "error",
+                            "message", "Terraform execution failed with exit code: " + exitCode
+                    ));
+                    emitter.send(errorMessage);
+                    throw new RuntimeException("Terraform execution failed.");
+                }
+            }
         } else {
-            return "Error executing Terraform, exit code: " + exitCode;
+            String errorMessage = objectMapper.writeValueAsString(Map.of(
+                    "type", "error",
+                    "message", "Terraform execution failed with exit code: " + exitCode
+            ));
+            emitter.send(errorMessage);
+            throw new RuntimeException("Terraform execution failed.");
         }
     }
 
     // DMS 작업을 생성하는 메서드
-    public String createDmsTask(Map<String, String> dmsTaskParams) throws IOException, InterruptedException {
-        // Terraform 명령 실행 후 DMS 작업 시작
-        String terraformOutput = executeTerraformWithProgress(dmsTaskParams);
-   //     startDmsTask();  // Terraform 후 DMS 작업을 시작
-        return terraformOutput;
+    public String createDmsTask(Map<String, String> dmsTaskParams, SseEmitter emitter) throws IOException, InterruptedException {
+        if (emitter == null) {
+            throw new IllegalArgumentException("Emitter is null. Cannot proceed.");
+        }
+
+        return executeTerraformWithProgress(dmsTaskParams, emitter);
     }
 
 }

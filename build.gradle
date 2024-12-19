@@ -41,7 +41,7 @@ dependencies {
 //	implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
 	implementation 'org.springframework.boot:spring-boot-starter-logging'
 	implementation 'com.amazonaws:aws-java-sdk-dms:1.12.300' // 최신 버전으로 업데이트 하세요
-
+	implementation 'com.googlecode.json-simple:json-simple:1.1'
 }
 
 tasks.named('test') {
