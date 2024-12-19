@@ -12,6 +12,7 @@ MigrateMate : AWS DMS를 활용한 클라우드 기반 데이터 마이그레이
 ```bash
 setx AWS_ACCESS_KEY_ID "your-access-key"
 setx AWS_SECRET_ACCESS_KEY "your-secret-access-key"
+```
 
 ### macOS/Linux
 ```bash
