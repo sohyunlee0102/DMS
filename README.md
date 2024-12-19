@@ -6,7 +6,7 @@ MigrateMate : AWS DMS를 활용한 클라우드 기반 데이터 마이그레이
 2. 이후 PR을 통해 main으로 merge
   
 ## 테스트 시 주의사항
-- 회원가입/로그인 구현 전 테스트를 위해 `accessKey` 및 `secretKey`를 환경 변수로 설정해야 합니다.
+회원가입/로그인 구현 전 테스트를 위해 `accessKey` 및 `secretKey`를 환경 변수로 설정해야 합니다.
     
 ### Windows  
 ```bash
