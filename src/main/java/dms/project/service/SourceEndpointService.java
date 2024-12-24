@@ -44,6 +44,21 @@ public class SourceEndpointService {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
+    private void sendMessage(SseEmitter emitter, String type, Object content) {
+        try {
+            // JSON 객체 생성
+            Map<String, Object> message = Map.of(
+                    "type", type,
+                    "content", content
+            );
+
+            // JSON 직렬화 후 전송
+            emitter.send(objectMapper.writeValueAsString(message));
+        } catch (Exception e) {
+            e.printStackTrace(); // 로그에 에러 출력
+        }
+    }
+
     public SseEmitter createEmitter(String clientId) {
         SseEmitter emitter = new SseEmitter(30 * 60 * 1000L); // 30분 타임아웃
         emitters.put(clientId, emitter);
@@ -145,11 +160,7 @@ public class SourceEndpointService {
                 while ((line = reader.readLine()) != null) {
                     output.append(line).append("\n");
                     System.out.println(line);  // 터미널에 실시간으로 출력
-                    try {
-                        emitter.send(line);
-                    } catch (IOException e) {
-                        e.printStackTrace();
-                    }
+                    sendMessage(emitter, "message", line);
                 }
             } catch (IOException e) {
                 e.printStackTrace();  // 로깅을 사용해도 좋음
@@ -162,11 +173,7 @@ public class SourceEndpointService {
                 while ((line = reader.readLine()) != null) {
                     output.append("ERROR: ").append(line).append("\n");
                     System.err.println(line);  // 오류는 에러 스트림으로 출력
-                    try {
-                        emitter.send("ERROR: " + line);
-                    } catch (IOException e) {
-                        e.printStackTrace();
-                    }
+                    sendMessage(emitter, "error", line);
                 }
             } catch (IOException e) {
                 e.printStackTrace();  // 로깅을 사용해도 좋음
@@ -198,8 +205,8 @@ public class SourceEndpointService {
         int outputExitCode = outputProcess.waitFor();
         if (outputExitCode == 0) {
             String arn = arnOutput.toString().trim();  // ARN 가져오기 성공
-            emitter.send("Terraform execution successful.");
-            emitter.send("Testing connection of created endpoint...");
+            sendMessage(emitter, "message", "Terraform execution successful.");
+            sendMessage(emitter, "message", "Testing connection of created endpoint...");
             System.out.println("Arn: " + arn);
             System.out.println("RI : " + replicationInstance);
             processBuilder.command("cmd.exe", "/c",
@@ -241,14 +248,14 @@ public class SourceEndpointService {
                         System.out.println("Contain");
                     }
                     if (describeExitCode == 0 && describeOutput.toString().contains("successful")) {
-                        emitter.send("Connection test successful on status check.");
+                        sendMessage(emitter, "message", "Connection test successful on status check.");
                         /*
                         ProcessBuilder unlockProcessBuilder = new ProcessBuilder("terraform", "force-unlock", "<lock_id>");
                         unlockProcessBuilder.start();
                          */
                         return arn;  // ARN 반환
                     } else if (describeOutput.toString().contains("testing"))  {
-                        emitter.send("Still testing...");
+                        sendMessage(emitter, "message", "Still testing...");
                         Thread.sleep(5000);  // 5초 대기 후 재시도
                     } else {
                         // describeOutput JSON 파싱
@@ -258,21 +265,10 @@ public class SourceEndpointService {
                         if (connections != null && connections.isArray() && connections.size() > 0) {
                             JsonNode connection = connections.get(0); // 첫 번째 연결 정보 사용
                             String lastFailureMessage = connection.get("LastFailureMessage").asText();
-
-                            // 에러 형식으로 프론트에 전달
-                            String errorMessage = objectMapper.writeValueAsString(Map.of(
-                                    "type", "error",
-                                    "message", lastFailureMessage
-                            ));
-                            emitter.send(errorMessage);
+                            sendMessage(emitter, "error", lastFailureMessage);
                             throw new RuntimeException("Test connection failed.");
                         } else {
-                            // 실패 이유를 추출할 수 없는 경우 기본 메시지 전달
-                            String errorMessage = objectMapper.writeValueAsString(Map.of(
-                                    "type", "error",
-                                    "message", "Unable to parse failure reason from response."
-                            ));
-                            emitter.send(errorMessage);
+                            sendMessage(emitter, "error", "Unable to parse failure reason from response.");
                             throw new RuntimeException("Test connection failed.");
                         }
                     }
@@ -282,20 +278,12 @@ public class SourceEndpointService {
                      */
                 }
             } else {
-                String errorMessage = objectMapper.writeValueAsString(Map.of(
-                        "type", "error",
-                        "message", "Connection test failed with exit code: " + connectionExitCode
-                ));
-                emitter.send(errorMessage);emitter.send("Connection test failed with exit code: " + connectionExitCode);
+                sendMessage(emitter, "error","Connection test failed with exit code: " + connectionExitCode);
                 throw new RuntimeException("Connection test failed.");
 
             }
         } else {
-            String errorMessage = objectMapper.writeValueAsString(Map.of(
-                    "type", "error",
-                    "message", "Terraform execution failed with exit code: " + exitCode
-            ));
-            emitter.send(errorMessage);
+            sendMessage(emitter, "error", "Terraform execution failed with exit code: " + exitCode);
             throw new RuntimeException("Terraform execution failed.");
         }
     }

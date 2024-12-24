@@ -12,7 +12,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
-
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -41,7 +40,21 @@ public class DmsController {
     @Autowired
     private final SseEmitter emitter;
 
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
     private final Map<String, SseEmitter> emitters = new ConcurrentHashMap<>();
+
+    private void sendMessage(SseEmitter emitter, String type, String content) {
+        try {
+            // JSON 객체 생성
+            Map<String, String> message = Map.of("type", type, "content", content);
+
+            // JSON 직렬화 후 전송
+            emitter.send(objectMapper.writeValueAsString(message));
+        } catch (Exception e) {
+            e.printStackTrace(); // 로그에 에러 출력
+        }
+    }
 
     @PostMapping("/create-source-endpoint")
     public ResponseEntity<String> createSourceEndpoint(@RequestBody SourceEndpointRequest request) {
@@ -51,7 +64,7 @@ public class DmsController {
         emitters.put(clientId, emitter); // 클라이언트 ID와 Emitter 매핑
         new Thread(() -> {
             try {
-                emitter.send("Starting source endpoint creation...");
+                sendMessage(emitter, "message", "Starting source endpoint creation...");
 
                 // 태그 배열을 쉼표로 구분된 문자열로 변환
                 StringBuilder tagsStringBuilder = new StringBuilder();
@@ -84,16 +97,12 @@ public class DmsController {
                         .data(result));
                 System.out.println(result);
 
-                emitter.send("Source endpoint creation completed.");
+                sendMessage(emitter, "message","Source endpoint creation completed.");
                 System.out.println("Before complete");
                 emitter.complete();
                 System.out.println("After complete");
             } catch (IOException | InterruptedException e) {
-                try {
-                    emitter.send("Error: " + e.getMessage());
-                } catch (IOException ioException) {
-                    ioException.printStackTrace();
-                }
+                sendMessage(emitter, "error", e.getMessage());
                 completeEmitterWithError(clientId, e);
             }
         }).start();
@@ -140,7 +149,7 @@ public class DmsController {
         emitters.put(clientId, emitter); // 클라이언트 ID와 Emitter 매핑
         new Thread(() -> {
             try {
-                emitter.send("Starting target endpoint creation...");
+                sendMessage(emitter, "message", "Starting target endpoint creation...");
 
                 // 태그 배열을 쉼표로 구분된 문자열로 변환
                 StringBuilder tagsStringBuilder = new StringBuilder();
@@ -173,16 +182,12 @@ public class DmsController {
                         .data(result));
                 System.out.println(result);
 
-                emitter.send("Target endpoint creation completed.");
+                sendMessage(emitter, "message", "Target endpoint creation completed.");
                 System.out.println("Before complete");
                 emitter.complete();
                 System.out.println("After complete");
             } catch (IOException | InterruptedException e) {
-                try {
-                    emitter.send("Error: " + e.getMessage());
-                } catch (IOException ioException) {
-                    ioException.printStackTrace();
-                }
+                sendMessage(emitter, "error", e.getMessage());
                 completeEmitterWithError(clientId, e);
             }
         }).start();
@@ -198,7 +203,7 @@ public class DmsController {
         emitters.put(clientId, emitter); // 클라이언트 ID와 Emitter 매핑
         new Thread(() -> {
             try {
-                emitter.send("Starting Replication Instance creation...");
+                sendMessage(emitter, "message", "Starting Replication Instance creation...");
                 // 태그 배열을 쉼표로 구분된 문자열로 변환
                 StringBuilder tagsStringBuilder = new StringBuilder();
                 for (Map<String, Object> tag : request.getTags()) {
@@ -236,16 +241,12 @@ public class DmsController {
                         .data(result));
                 System.out.println(result);
 
-                emitter.send("Replication Instance creation completed.");
+                sendMessage(emitter, "message", "Replication Instance creation completed.");
                 System.out.println("Before complete");
                 emitter.complete();
                 System.out.println("After complete");
             } catch (IOException | InterruptedException e) {
-                try {
-                    emitter.send("Error: " + e.getMessage());
-                } catch (IOException ioException) {
-                    ioException.printStackTrace();
-                }
+                sendMessage(emitter, "error", e.getMessage());
                 completeEmitterWithError(clientId, e);
             }
         }).start();
@@ -262,7 +263,7 @@ public class DmsController {
         emitters.put(clientId, emitter); // 클라이언트 ID와 Emitter 매핑
         new Thread(() -> {
             try {
-                emitter.send("Starting Replication Task creation...");
+                sendMessage(emitter, "message", "Starting Replication Task creation...");
                 StringBuilder tagsStringBuilder = new StringBuilder();
                 for (Map<String, Object> tag : request.getTags()) {
                     String key = (String) tag.get("key");
@@ -307,7 +308,10 @@ public class DmsController {
                 System.out.println("HERE IN CONTROLLER");
 
                 // Terraform 명령 실행 및 결과를 실시간으로 클라이언트에 전달
-                dmsService.createDmsTask(dmsTaskParams, emitter);
+                String result = dmsService.createDmsTask(dmsTaskParams, emitter);
+                emitter.send(SseEmitter.event()
+                        .name("task") // 이벤트 이름 지정
+                        .data(result));
 
                 // Terraform 실행 후 결과 전달 (성공 메시지)
            //     emitter.send("Replication task completed.");
@@ -315,11 +319,7 @@ public class DmsController {
             //    emitter.complete();
                 System.out.println("After complete");
             } catch (IOException | InterruptedException e) {
-                try {
-                    emitter.send("Error: " + e.getMessage());
-                } catch (IOException ioException) {
-                    ioException.printStackTrace();
-                }
+                sendMessage(emitter, "error", e.getMessage());
                 completeEmitterWithError(clientId, e);
             }
         }).start();
@@ -380,13 +380,19 @@ public class DmsController {
       //      emitter.complete();
             return ResponseEntity.ok(clientId);
         } catch (RuntimeException e) {
-            try {
-                emitter.send("Error: " + e.getMessage());
-            } catch (IOException ioException) {
-                ioException.printStackTrace();
-            }
+            sendMessage(emitter, "error", e.getMessage());
             completeEmitterWithError(clientId, e);
             return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("오류: " + e.getMessage());
+        }
+    }
+
+    @PostMapping("/stop-task")
+    public ResponseEntity<String> stopTask(@RequestBody StopTaskRequest request) {
+        try {
+            String result = dmsService.stopTask(request.getTaskArn());
+            return ResponseEntity.ok(result);
+        } catch (Exception e) {
+            return ResponseEntity.status(500).body("Error stopping task: " + e.getMessage());
         }
     }
 

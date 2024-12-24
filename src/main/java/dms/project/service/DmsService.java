@@ -22,6 +22,38 @@ public class DmsService {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
+    private void sendMessage(SseEmitter emitter, String type, Object content) {
+        try {
+            // JSON 객체 생성
+            Map<String, Object> message = Map.of(
+                    "type", type,
+                    "content", content
+            );
+
+            // JSON 직렬화 후 전송
+            emitter.send(objectMapper.writeValueAsString(message));
+        } catch (Exception e) {
+            e.printStackTrace(); // 로그에 에러 출력
+        }
+    }
+
+    public String stopTask(String taskArn) {
+        try {
+            StopReplicationTaskResponse stopResponse = databaseMigrationClient.stopReplicationTask(
+                    StopReplicationTaskRequest.builder()
+                            .replicationTaskArn(taskArn)
+                            .build()
+            );
+            System.out.println("Replication task stopped successfully: " + taskArn);
+       //     sendMessage(emitter, "message", "Replication task stopped successfully.");
+            return "Task stopped successfully: " + taskArn;
+        } catch (Exception e) {
+            System.err.println("Error stopping replication task: " + e.getMessage());
+     //       sendMessage(emitter, "error", "Failed to stop replication task: " + e.getMessage());
+            throw new RuntimeException("Failed to stop task: " + e.getMessage());
+        }
+    }
+
     public void startTask(String taskArn, SseEmitter emitter) {
         Boolean restart = false;
 
@@ -55,7 +87,7 @@ public class DmsService {
         // 2. 상태 확인을 위한 쓰레드 시작
         new Thread(() -> {
             try {
-                emitter.send("Start Data Migration...");
+                sendMessage(emitter, "message", "Start Data Migration...");
 
                 while (true) {
                     try {
@@ -83,28 +115,18 @@ public class DmsService {
                             System.out.println("Task Status: " + status);
                             System.out.println("Task Progress: " + progress);
 
-                            try {
-                                emitter.send(Map.of(
-                                        "statusOfTask", status,
-                                        "progressOfTask", progress
-                                ));
-                            } catch (IOException e) {
-                                System.err.println("Error sending event: " + e.getMessage());
-                                break;
-                            }
+                            sendMessage(emitter, "message", Map.of(
+                                    "statusOfTask", status,
+                                    "progressOfTask", progress
+                            ));
 
                             if ("completed".equalsIgnoreCase(status) || "stopped".equalsIgnoreCase(status)) {
                                 System.out.println("Task completed successfully.");
-                                emitter.send("Data Migration completed.");
+                                sendMessage(emitter, "message", "Data Migration completed.");
                                 emitter.complete();
                                 break;
                             } else if ("failed".equalsIgnoreCase(status)) {
-                                String errorMessage = objectMapper.writeValueAsString(Map.of(
-                                        "type", "error",
-                                        "message", "Data Migration has failed."
-                                ));
-                                System.err.println("Task failed: " + errorMessage);
-                                emitter.send(errorMessage);
+                                sendMessage(emitter, "error", "Data Migration has failed.");
                                 emitter.complete();
                                 break;
                             }
@@ -123,14 +145,7 @@ public class DmsService {
                     }
                 }
             } catch (Exception e) {
-                try {
-                    emitter.send(new ObjectMapper().writeValueAsString(Map.of(
-                            "type", "error",
-                            "message", "Migration task execution has failed."
-                    )));
-                } catch (IOException ioException) {
-                    System.err.println("Failed to send error message: " + ioException.getMessage());
-                }
+                sendMessage(emitter, "error", "Migration task execution has failed.");
             } finally {
                 emitter.complete();
             }
@@ -216,11 +231,8 @@ public class DmsService {
                 String line;
                 while ((line = reader.readLine()) != null) {
                     System.out.println(line);
-                    try {
-                        emitter.send(line);
-                    } catch (IOException e) {
-                        e.printStackTrace();
-                    }
+                    sendMessage(emitter, "message", line);
+
                 }
             } catch (IOException e) {
                 e.printStackTrace();
@@ -232,11 +244,7 @@ public class DmsService {
                 String line;
                 while ((line = reader.readLine()) != null) {
                     System.err.println(line);
-                    try {
-                        emitter.send("ERROR: " + line);
-                    } catch (IOException e) {
-                        e.printStackTrace();
-                    }
+                    sendMessage(emitter, "error", line);
                 }
             } catch (IOException e) {
                 e.printStackTrace();
@@ -256,7 +264,7 @@ public class DmsService {
         if (exitCode == 0) {
             if ("false".equals(dmsTaskParams.get("startTaskOnCreation"))) {
                 System.out.println("false");
-                emitter.send("Migration task creation completed.");
+                sendMessage(emitter, "message", "Migration task creation completed.");
                 emitter.complete();
                 return "Success";
             } else {
@@ -275,22 +283,14 @@ public class DmsService {
                     String taskArn = reader.readLine();  // output값을 추출
                     System.out.println("Before start");
                     startTask(taskArn, emitter);  // DMS 태스크 수동 시작
-                    return "Success";
+                    return taskArn;
                 } else {
-                    String errorMessage = objectMapper.writeValueAsString(Map.of(
-                            "type", "error",
-                            "message", "Terraform execution failed with exit code: " + exitCode
-                    ));
-                    emitter.send(errorMessage);
+                    sendMessage(emitter, "error","Terraform execution failed with exit code: " + exitCode);
                     throw new RuntimeException("Terraform execution failed.");
                 }
             }
         } else {
-            String errorMessage = objectMapper.writeValueAsString(Map.of(
-                    "type", "error",
-                    "message", "Terraform execution failed with exit code: " + exitCode
-            ));
-            emitter.send(errorMessage);
+            sendMessage(emitter, "error", "Terraform execution failed: " + exitCode);
             throw new RuntimeException("Terraform execution failed.");
         }
     }

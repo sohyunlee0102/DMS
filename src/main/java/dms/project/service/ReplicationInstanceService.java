@@ -38,6 +38,21 @@ public class ReplicationInstanceService {
 
     private static final Logger logger = LoggerFactory.getLogger(ReplicationInstanceService.class);
 
+    private void sendMessage(SseEmitter emitter, String type, Object content) {
+        try {
+            // JSON 객체 생성
+            Map<String, Object> message = Map.of(
+                    "type", type,
+                    "content", content
+            );
+
+            // JSON 직렬화 후 전송
+            emitter.send(objectMapper.writeValueAsString(message));
+        } catch (Exception e) {
+            e.printStackTrace(); // 로그에 에러 출력
+        }
+    }
+
     public List<Map<String, String>> getRIs(String region) {
         // 주어진 리전을 기반으로 새 클라이언트 생성
         DatabaseMigrationClient regionalClient = databaseMigrationClient;
@@ -182,11 +197,7 @@ public class ReplicationInstanceService {
                 while ((line = reader.readLine()) != null) {
                     output.append(line).append("\n");
                     System.out.println(line);  // 터미널에 실시간으로 출력
-                    try {
-                        emitter.send(line);
-                    } catch (IOException e) {
-                        e.printStackTrace();
-                    }
+                    sendMessage(emitter, "message", line);
                 }
             } catch (IOException e) {
                 e.printStackTrace();  // 로깅을 사용해도 좋음
@@ -199,12 +210,7 @@ public class ReplicationInstanceService {
                 while ((line = reader.readLine()) != null) {
                     output.append("ERROR: ").append(line).append("\n");
                     System.err.println(line);  // 오류는 에러 스트림으로 출력
-                    try {
-                        emitter.send("ERROR: " + line);
-                    } catch (IOException e) {
-                        e.printStackTrace();
-                    }
-                }
+                    sendMessage(emitter, "error", line);                }
             } catch (IOException e) {
                 e.printStackTrace();  // 로깅을 사용해도 좋음
             }
