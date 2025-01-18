@@ -25,23 +25,24 @@ repositories {
 
 dependencies {
 //	implementation 'org.springframework.boot:spring-boot-starter-oauth2-client'
-//	implementation 'org.springframework.boot:spring-boot-starter-security'
+	implementation 'org.springframework.boot:spring-boot-starter-security'
 	implementation 'org.springframework.boot:spring-boot-starter-web'
 	compileOnly 'org.projectlombok:lombok'
 //	runtimeOnly 'com.mysql:mysql-connector-j'
-//	runtimeOnly 'com.oracle.database.jdbc:ojdbc11'
+	runtimeOnly 'com.oracle.database.jdbc:ojdbc11'
 	annotationProcessor 'org.projectlombok:lombok'
 	testImplementation 'org.springframework.boot:spring-boot-starter-test'
-//	testImplementation 'org.springframework.security:spring-security-test'
+	testImplementation 'org.springframework.security:spring-security-test'
 	testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 //	implementation 'org.apache.commons:commons-io:2.11.0'
 
 	implementation 'software.amazon.awssdk:aws-sdk-java:2.20.32'
 	implementation 'software.amazon.awssdk:auth:2.20.0' // 인증 관련 클래스
-//	implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+	implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
 	implementation 'org.springframework.boot:spring-boot-starter-logging'
 	implementation 'com.amazonaws:aws-java-sdk-dms:1.12.300' // 최신 버전으로 업데이트 하세요
 	implementation 'com.googlecode.json-simple:json-simple:1.1'
+	implementation 'org.springdoc:springdoc-openapi-starter-webmvc-ui:2.3.0'
 }
 
 tasks.named('test') {
